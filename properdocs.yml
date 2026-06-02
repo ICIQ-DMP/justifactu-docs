@@ -18,6 +18,9 @@ extra:
 docs_dir: docs
 site_dir: site
 
+hooks:
+  - docs/hooks.py
+
 theme:
   name: material
   custom_dir: docs/overrides
@@ -63,7 +66,7 @@ plugins:
   - mkdocstrings:
       handlers:
         python:
-          paths: ["source"]
+          paths: ["source/src", "source"]
           options:
             docstring_style: google
             show_source: true
