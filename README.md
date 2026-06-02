@@ -1,18 +1,9 @@
-# template-docs
+# justifactu-docs
 
-ProperDocs base repo for ICIQ-DMP project documentation.  
-Fork this repo to create `PROJECT-docs` for any ICIQ project.
+ProperDocs documentation for [justifactu](https://github.com/ICIQ-DMP/justifactu) —
+software to automate billing justification at ICIQ.
 
-## Forking checklist
-
-1. Fork this repo to `iciq-dmp/PROJECT-docs`.
-2. In `properdocs.yml`, update the **PROJECT-SPECIFIC** block at the top:
-   - `site_name`, `site_url`, `repo_url`, `repo_name`
-   - `extra.source_repo` — the GitHub repo containing the source code
-   - `extra.project_name`
-3. Edit `docs/index.md` with the project description.
-4. Enable GitHub Pages in the repo settings (source: **GitHub Actions**).
-5. Push to `main`/`master` — the `deploy-docs.yml` workflow will build and deploy.
+Published at <https://iciq-dmp.github.io/justifactu/>.
 
 ## Syncing template changes
 
@@ -40,7 +31,7 @@ requirements.txt
 **With Docker (recommended):**
 
 ```bash
-git clone https://github.com/iciq-dmp/PROJECT_NAME source
+git clone https://github.com/ICIQ-DMP/justifactu source
 docker compose up
 ```
 
@@ -50,7 +41,7 @@ Open <http://localhost:8000>.
 
 ```bash
 pip install -r requirements.txt
-git clone https://github.com/iciq-dmp/PROJECT_NAME source
+git clone https://github.com/ICIQ-DMP/justifactu source
 properdocs serve
 ```
 

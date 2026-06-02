@@ -1,7 +1,7 @@
 # Explanation
 
 Explanations are **understanding-oriented**. They clarify and illuminate
-the design decisions, architecture, and concepts behind PROJECT_NAME.
+the design decisions, architecture, and concepts behind justifactu.
 
 ---
 

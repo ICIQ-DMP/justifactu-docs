@@ -1,16 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # PROJECT-SPECIFIC — change these when forking the template
 # ─────────────────────────────────────────────────────────────────────────────
-site_name: "PROJECT_NAME Documentation"
-site_url: "https://iciq-dmp.github.io/PROJECT_NAME/"
-repo_url: "https://github.com/iciq-dmp/PROJECT_NAME"
-repo_name: "iciq-dmp/PROJECT_NAME"
+site_name: "justifactu Documentation"
+site_url: "https://iciq-dmp.github.io/justifactu/"
+repo_url: "https://github.com/ICIQ-DMP/justifactu"
+repo_name: "ICIQ-DMP/justifactu"
 
 # Source code repo from which API reference is generated.
 # This value is also read by the CI workflow (see .github/workflows/deploy-docs.yml).
 extra:
-  source_repo: "iciq-dmp/PROJECT_NAME"
-  project_name: "PROJECT_NAME"
+  source_repo: "ICIQ-DMP/justifactu"
+  project_name: "justifactu"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # COMMON — do not change; update in template-docs and sync to forks

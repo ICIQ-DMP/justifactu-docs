@@ -1,6 +1,9 @@
-# PROJECT_NAME
+# justifactu
 
-Brief one-paragraph description of what PROJECT_NAME does and who it is for.
+justifactu automates billing justification at ICIQ.
+It reads billing PDFs and Excel remittance files from Microsoft SharePoint/OneDrive,
+extracts SAP invoice identifiers from each PDF, and renames and organises the files — replacing
+a manual, error-prone accounting workflow.
 
 ## Where to start
 
