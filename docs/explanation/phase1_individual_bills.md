@@ -1,68 +1,239 @@
-# Understanding Individual Bills Justification
+# Justifactu — Technical Documentation
 
-## Overview
+## Contents
 
-* **What it is:** Most of the files that need justification come from individual bills and their respective payments, so we decided to face these cases first. In this automation, we created a process that renames, matches and merges each bill (*factura*) with its corresponding payment proof (*remesa*), producing a single justification PDF per bill, and reports anything it couldn't process cleanly.
-* **Its primary role:** It removes the manual work of cross-referencing an invoice against its proof of payment inside Sharepoint-hosted batches of files, and produces a single, self-contained justification document per bill plus a QA report for the cases that need a human to manage them.
-
----
-
-## The Problem Space (Why do we need this?)
-
-Justification requests need, for each bill, evidence that it was actually paid, but bills and their payment proofs don't arrive as matched pairs. Payments are grouped into bank remittance batches, and a person had to manually find, inside each batch, the one payment that corresponds to a given bill, then combine the two documents.
-
-* **Volume and structure make manual matching error-prone.** Remittance batches are deeply nested (year -> bank -> specific remittance) and contain many individual payments PDFs, which makes picking the right one by eye tedious.
-* **Payments and bills don't share a common filename convention out of the box.** A bill is named around its invoice reference, but a payment file, before this automation, could be named however the bank export happened to name it. Matching them requires normalizing both to the same identifier first.
-* **Failures need to be visible.** A bill with no matching payment, an unreadable filename or a corrupted file shouldn't just vanish from the process, someone needs to know it wasn't handled, and why.
+1. [Overview](#1-overview)
+2. [Architecture](#2-architecture)
+3. [Components](#3-components)
+4. [Data flow](#4-data-flow)
+5. [Identifiers & naming conventions](#5-identifiers--naming-conventions)
+6. [Configuration](#6-configuration)
+7. [Running it](#7-running-it)
+8. [Testing](#8-testing)
+9. [Known limitations](#9-known-limitations)
+10. [Glossary](#10-glossary)
 
 ---
 
-## Design and Architecture (How we solved it)
+## 1. Overview
 
-The pipeline is built around a single normalized identifier, the **SAP ID**, extracted form both sides independently, so matching doesn't depend on either bill or payment filenames looking alike.
-1. **Normalize payment filenames.** Payment files, as they arrive in a remittance batch, get renamed to a canonical `<sap_id>-P.pdf` form by reading the SAP ID out of the PDF's own content.
-2. **Match.** Bills are walked from their input folder, each bill's SAP ID is parsed from its filename and looked up against an index built from the normalized payment filenames.
-3. **Merge.** A matched bill and payment are merged into a single output PDF, named and filed under a year-based output folder.
-4. **Close out.** The payment is renamed again to mark it as processed, and the original bill is removed once the merge is confirmed.
-5. **Report.** Anything that didn't fit the happy path, such as not a PDF, unparseable filename, no match found, a failed merge or rename, is logged to a dedicated QA report, uploaded alongside the run's output, and optionally emailed to an admin.
+## 1. Overview
 
-Input files are found in Sharepoint. A local mirror is kept via a dedicated one-way sync client (download-only scoped to the input folder), which the pipeline reads from directly. Anything the pipeline needs to change on Sharepoint's side (renames, uploads, etc.) goes through direct Microsoft Graph API calls, independent of that sync client, since the sync client itself never pushes local changes back up.
+- Justifactu automates matching and merging bills (*facturas*) with their corresponding payments (*remeses*) stored in SharePoint. Payments are renamed to the SAP ID found in their PDF content; bills, already named with their SAP ID, are matched against that renamed set and combined into a single justification PDF per pair.
 
-### Key Mechanisms
+- The pipeline runs every few days, keeping the volume of unprocessed documents manageable between runs. It operates independently of Finances or any other department's systems or schedule.
 
-* **SAP ID matching:** both bills and payments are reduces to a shared identifier (SAP ID) via regex extraction, and matched via equality on that identifier rather than on raw filenames. This decouples the match from whatever naming convention either side happens to arrive with.
-* **Remote-before-local renaming:** whenever a file needs renaming and has a Sharepoint counterpart, the Sharepoint rename is attempted first. The local rename only happens if that succeeds. This guarantees local and remote state can never silently disagree: a failed Sharepoint rename leaves the local file untouched, so the next run picks it up again instead of the pipeline believing something is done that Sharepoint never saw.
-* **Tagged QA logging:** log records that represent something needing follow-up are marked with a dedicated tag, independent of their severity level. A filtered log handler collects only tagged records into a separate QA report file, which becomes both the uploaded artifact and the emailed summary, keeping the errors decoupled from the general operational log.
-
-### Design Decisions
-
-* **Decision:** Match bills to payments via an extracted SAP ID rather than direct filename comparison.
-* **Rationale:** Bills and payments never shared a filename convention, anchoring the match to a value derived independently from each side's own content/filename made the pipeline resilient to inconsistent naming across different remittance sources.
-
-* **Decision:** Perform the Sharepoint-side rename before the local rename, not the other way around or in parallel.
-* **Rationale:** A rename that succeeds locally but fails remotely leaves two systems permanently out of sync with no clean way to detect it later. Ordering it remote-first menas a failure is always safe to retry, and success always means both sides agree. 
-
-* **Decision:** Keep the QA report as a plain, append-only text log rather than a structured report.
-* **Rationale:** It needed to serve two purposes with no extra code: be used as a readable email body, and a file that can be uploaded as-is next to the run's other output. A structured format, on the other hand, would need a rendering step for either use.
+- Justifactu replaces a manual, repetitive process that previously took significant time each month from the people responsible for these justifications. Automating the matching and merging leaves only the final review as manual work.
 ---
 
-## Alternatives Considered
+## 2. Architecture
 
-* **Relying on the OneDrive sync client to propagate renames back to SharePoint**, instead of calling the Graph API directly: considered implicitly by the sync client being present at all, but it's a **download-only** mirror by design, so it never pushes local changes upstream. Any rename made to the local mirror would never reach SharePoint on its own, which is why the pipeline talks to Graph directly for anything it needs to change remotely.
+```mermaid
+flowchart LR
+    SP[(SharePoint)]
+    OD["OneDrive-for-Linux
+    (download-only sync)"]
+    LC[(Local cache)]
+    APP["Pipeline
+    (app container)"]
+    GAPI["Microsoft Graph API"]
 
----
+    SP -- "sync: read-only" --> OD
+    OD -- "mirrors to disk" --> LC
+    LC -- "reads input" --> APP
+    APP -- "writes: rename / delete / upload" --> GAPI
+    GAPI -- "mutates" --> SP
+```
 
-## Trade-offs and Limitations
+- SharePoint serves as the only source of truth, and we use OneDrive-for-Linux to sync the relevant directories in download-only mode. This produces a local cache that serves as a temporal reference to do the main process. All of this runs in a Jenkins pipeline that manages the automation process, and it connects to various APIs throughout the run to do each step.
 
-* **Deleting the source bill on successful merge is irreversible.** Once a bill is merged and marked processed, its original file is removed. If the merge later turns out to be wrong (e.g. filed under an incorrect name), there is no way to regenerate it from the pipeline's own inputs; fixing it requires manual intervention on whatever survived.
-* **Matching is entirely SAP-ID-driven — a bill with no correspondingly-tagged payment is simply left unmatched**, not partially reconciled or queued for manual pairing. It shows up in the QA report, but resolving it is a manual step outside the pipeline.
-* **The local input mirror is an all-or-nothing sync.** The sync client mirrors its entire configured scope; there's no lightweight or incremental way to pull down just a subset of input data through it, which makes iterating on or testing the pipeline against a small dataset slower than it needs to be without a separate workaround.
-* **A failure in an optional, downstream step (e.g. sending the QA report notification) can be indistinguishable from a failure of the core pipeline unless each stage is given its own error boundary.** The pipeline's success/failure signal is only as meaningful as how carefully each stage's exceptions are scoped.
+> [!IMPORTANT]
+> Core design principle: local files are a disposable cache, and only SharePoint changes are durable.
+
+- This automation has two main containers: `app` and `onedrive`.
+  - `app` contains the installation of Justifactu itself. It's a one-shot script, meaning it doesn't run continuously.
+  - `onedrive` is a long-running service that contains the sync process with SharePoint, and every 5 minutes mirrors the contents of the SharePoint directory and applies any changes. Since SharePoint is the source of truth of this whole project, this process is download-only to avoid local filesystem interference.
 
 ---
 
-## Related Concepts
+## 3. Components
 
-* **How-to Guide:** [Link to how to implement/use this concept]
-* **Tutorial:** [Link to a beginner learning path involving this concept]
-* **Reference:** [Link to API/Command reference for this component]
+| Area                       | Files                                   | Key functions                                                                                                                               | Responsibility                                                                                                                                                                                                                                                                                         |
+|----------------------------|-----------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Ingestion & matching**   | `bills.py`, `payments.py`, `process.py` | `parse_bill_filename`, `parse_sap_id_from_bill`, `index_payments`, `rename_payments`, `merge_bills_and_payments`, `cleanup_processed_files` | Extracts the SAP ID from each side — from the bill's filename via regex, from the payment's PDF content via `pypdf` — matches bills to payments on that shared ID, drives the SharePoint-side payment rename, and after a successful merge marks the payment `_merged` and removes the processed bill. |
+| **PDF generation**         | `pdf.py`                                | `merge_pdfs`                                                                                                                                | Combines a matched bill and payment into the single output PDF that gets uploaded to SharePoint.                                                                                                                                                                                                       |
+| **SharePoint integration** | `sharepoint.py`, `token_manager.py`     | `rename_remote_item`, `delete_remote_item`, `upload_folder_recursive`, `download_folder_recursive`, `TokenManager.get_token`                | All Graph API calls — listing, downloading, uploading, renaming, and deleting remote items — plus the OAuth2 client-credentials token lifecycle that authenticates every one of those calls. This is the only place in the codebase that ever mutates SharePoint.                                      |
+| **Secrets**                | `secret.py`, `vault.py`                 | `read_secret`, `_VaultClient`                                                                                                               | Resolves credentials through a fallback chain (mounted secret file → repo `secrets/` folder → environment variable → HashiCorp Vault via AppRole), so the same code runs unmodified in local dev and in the deployed containers.                                                                       |
+| **Logging & QA reporting** | `logger.py`                             | `QAFilesFilter`, `setup_logging`                                                                                                            | Standard logging, plus a tagging mechanism (`extra={"qa_report": True}`) that lets any log call anywhere in the codebase mark itself as QA-report-worthy; a dedicated filtered handler collects only those into the separate QA report file.                                                           |
+| **Mailing**                | `mail.py`                               | `send_mail`, `send_qa_report_mail`                                                                                                          | SMTP delivery (STARTTLS) of the end-of-run notification, with the QA report and full run log attached as files rather than pasted into the body.                                                                                                                                                       |
+| **CLI / entry point**      | `arguments.py`, `main.py`               | `parse_arguments`, `main`                                                                                                                   | Defines the CLI surface (`--location`, `--input-location`, `--download-input`, `--download-subfolder`) and orchestrates the full run: connect to SharePoint, optionally force-download, rename payments, match and merge, clean up, upload outputs, send the notification mail.                        |
+
+---
+
+## 4. Data flow
+
+```mermaid
+flowchart TD
+    A[Input arrives from SharePoint into local cache via OneDrive sync]
+    B[Payments renamed to match inner SAP ID]
+    C[Bills matched with payments sharing SAP ID]
+    D[New PDF created merging paired files]
+    E[Payment marked as processed]
+    F[Processed bill deleted on SharePoint and local]
+    G[Outputs and QA report uploaded to SharePoint]
+    H[Confirmation mail sent with logs attached]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+```
+
+---
+
+## 5. Identifiers & naming conventions
+
+- SAP ID: formed by the corresponding year and a 6-digit number. Bills are already named based on it, while payments receive theirs from their PDF content.
+
+- File naming stages for payments:
+
+  ```mermaid
+  flowchart LR
+      A[Original bank filename]
+      B[sap_id-P]
+      C[sap_id-P_merged]
+
+      A -->|rename_payments| B
+      B -->|cleanup_processed_files| C
+  ```
+
+- SharePoint folder layout:
+  - `_input`
+    - `FACTURES`
+    - `Remeses`
+  - `_output`
+    - `FACTURES+PAGAMENTS`
+      - `2025_FACTURES+PAGAMENTS`
+      - `2026_FACTURES+PAGAMENTS`
+      - ...
+    - `QA`
+
+---
+
+## 6. Configuration
+
+### Secrets
+
+<table>
+<tr><th>SharePoint</th><th>SMTP</th></tr>
+<tr valign="top">
+<td>
+
+- `CLIENT_ID`
+- `CLIENT_NAME`
+- `CLIENT_SECRET`
+- `OBJECT_ID`
+- `SHAREPOINT_DOMAIN`
+- `DRIVE_ID`
+- `SITE_NAME`
+- `TENANT_ID`
+
+</td>
+<td>
+
+- `SMTP_PASSWORD`
+- `SMTP_PORT`
+- `SMTP_DEVELOPER_EMAIL`
+- `SMTP_SERVER`
+- `SMTP_USERNAME`
+- `SMTP_ADMIN_EMAIL`
+- `SMTP_OWNER_EMAIL`
+
+</td>
+</tr>
+</table>
+
+### `service/onedrive/conf/config`
+
+This file controls how OneDrive-For-Linux behaves, what it syncs, how often, and how the local mirror is kept in line with SharePoint. Its contents are the following:
+
+| Setting               | Description                                                                                                                                                            |
+|-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `sync_dir`            | Container path the client writes the synced mirror into.                                                                                                               |
+| `drive_id`            | Graph API identifier of the SharePoint directory being mirrored.                                                                                                       |
+| `download_only`       | Setting that defines the rest of the architecture. Defines a one-way sync with SharePoint, and the local client will never push any change.                            |
+| `cleanup_local_files` | Makes `download_only` mode also delete local files once their SharePoint counterpart has been deleted, in order to not accumulate orphaned copies.                     |
+| `monitor_interval`    | How often, in seconds, the client tries to sync changes from SharePoint. It's currently set to 60, but this change is rejected by the client and defaults back to 300. |
+
+> [!WARNING]
+> `drive_id` has to match exactly the real drive — do not modify manually without care.
+
+### `compose.yml`
+
+It defines two services, which have healthchecks to ensure they are working properly, and with one dependency between them:
+
+| Service    | Description                                                                                                                                                                                    |
+|------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `app`      | Builds from the local `Dockerfile`, and won't start until `onedrive`'s healthcheck passes. It mounts the shared sync directory and applies `--input_location` pointing directly at that mount. |
+| `onedrive` | Long-running service with three volumes (`conf`, `data`, and `logs`).                                                                                                                          |
+
+---
+
+## 7. Running it
+
+### Local dev setup
+
+1. Install dependencies:
+   ```bash
+   make install
+   ```
+
+2. Run the pipeline:
+   ```bash
+   make run CMD=""
+   ```
+
+> [!TIP]
+> `make run` alone just prints `--help`, since `CMD` defaults to that — always override it explicitly.
+
+### Common invocations
+
+| Goal                                                                   | Command                                                                                      |
+|------------------------------------------------------------------------|----------------------------------------------------------------------------------------------|
+| Default run against SharePoint                                         | `make run CMD=""`                                                                            |
+| Force a fresh download before processing (OneDrive sync fallen behind) | `make run CMD="--download-input"`                                                            |
+| Download only a specific subfolder                                     | `make run CMD="--download-input --download-subfolder Remeses_prova"`                         |
+| Run against local test data instead of SharePoint                      | `make run CMD="--location local --input-location ./service/onedrive/data/justifactu/_input"` |
+
+---
+
+## 8. Testing
+
+- In order to run the test suite, simply run the command `make test` on console inside the environment.
+- Instead of using remote calls, we use mock calls to the different services in order to do relevant tests, since local files are not the source of truth of the project. The objective of this testing strategy is to follow the architecture structure.
+
+---
+
+## 9. Known limitations
+
+> [!CAUTION]
+> - Bill deletion after merge is irreversible. Depending on future needs, we might move deleted items to the trash instead of a direct deletion.
+> - Local mirror lag relative to SharePoint. Since OneDrive-For-Linux takes minutes to read, check, and download new content and erase the ones not mirrored in SharePoint, the process could incur some syncing lag. However, this pipeline is designed to be run once every few days, so it should have ample time to sync before each full run.
+> - No network timeouts on HTTP calls yet.
+
+---
+
+## 10. Glossary
+
+| Term           | Definition                                                                                                                                                                                                                                    |
+|----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Factura**    | A bill. It's a PDF document containing an individual bill assigned to a specific transaction. It comes with its SAP ID already put in the name, and is located in the `FACTURES` folder in the SharePoint folder structure.                   |
+| **Remesa**     | A batch of payments. Each remesa contains an amount of payments, sorted by bank and month of the year. They are named initially by the bank that expedites them.                                                                              |
+| **Justificar** | To justify. The act of assigning the appropriate bill to each payment, thus justifying each expense with an external document.                                                                                                                |
+| **SAP ID**     | The unique identification number assigned to each entry on the SAP platform. It is the indicator that correlates each bill with its payment.                                                                                                  |
+| **QA report**  | Document generated at the end of each run that contains all the information on the documents that didn't pass correctly through the pipeline, be it either a wrongly-named bill or a payment without a correct SAP ID inside, amongst others. |
+| **Remote**     | That which happens outside the current physical system, such as external services like SharePoint or the mailing API connection.                                                                                                              |
+| **Local**      | That which happens on the current physical system, like the main execution and the Docker containers that host the downloaded data from SharePoint.                                                                                           |
