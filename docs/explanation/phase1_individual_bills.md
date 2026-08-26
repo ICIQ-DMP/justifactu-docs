@@ -17,13 +17,17 @@
 
 ## 1. Overview
 
-## 1. Overview
+- Justifactu automates matching and merging bills (*facturas*) with their corresponding payments (*remeses*) stored in
+  SharePoint. Payments are renamed to the SAP ID found in their PDF content; bills, already named with their SAP ID,
+  are matched against that renamed set and combined into a single justification PDF per pair.
 
-- Justifactu automates matching and merging bills (*facturas*) with their corresponding payments (*remeses*) stored in SharePoint. Payments are renamed to the SAP ID found in their PDF content; bills, already named with their SAP ID, are matched against that renamed set and combined into a single justification PDF per pair.
+- The pipeline runs every few days, keeping the volume of unprocessed documents manageable between runs. It operates
+  independently of Finances or any other department's systems or schedule.
 
-- The pipeline runs every few days, keeping the volume of unprocessed documents manageable between runs. It operates independently of Finances or any other department's systems or schedule.
+- Justifactu replaces a manual, repetitive process that previously took significant time each month from the people
+  responsible for these justifications. Automating the matching and merging leaves only the final review as manual
+  work.
 
-- Justifactu replaces a manual, repetitive process that previously took significant time each month from the people responsible for these justifications. Automating the matching and merging leaves only the final review as manual work.
 ---
 
 ## 2. Architecture
@@ -45,14 +49,19 @@ flowchart LR
     GAPI -- "mutates" --> SP
 ```
 
-- SharePoint serves as the only source of truth, and we use OneDrive-for-Linux to sync the relevant directories in download-only mode. This produces a local cache that serves as a temporal reference to do the main process. All of this runs in a Jenkins pipeline that manages the automation process, and it connects to various APIs throughout the run to do each step.
+- SharePoint serves as the only source of truth, and we use OneDrive-for-Linux to sync the relevant directories in
+  download-only mode. This produces a local cache that serves as a temporal reference to do the main process. All of
+  this runs in a Jenkins pipeline that manages the automation process, and it connects to various APIs throughout the
+  run to do each step.
 
 > [!IMPORTANT]
 > Core design principle: local files are a disposable cache, and only SharePoint changes are durable.
 
 - This automation has two main containers: `app` and `onedrive`.
   - `app` contains the installation of Justifactu itself. It's a one-shot script, meaning it doesn't run continuously.
-  - `onedrive` is a long-running service that contains the sync process with SharePoint, and every 5 minutes mirrors the contents of the SharePoint directory and applies any changes. Since SharePoint is the source of truth of this whole project, this process is download-only to avoid local filesystem interference.
+  - `onedrive` is a long-running service that contains the sync process with SharePoint, and every 5 minutes mirrors
+    the contents of the SharePoint directory and applies any changes. Since SharePoint is the source of truth of this
+    whole project, this process is download-only to avoid local filesystem interference.
 
 ---
 
@@ -96,7 +105,8 @@ flowchart TD
 
 ## 5. Identifiers & naming conventions
 
-- SAP ID: formed by the corresponding year and a 6-digit number. Bills are already named based on it, while payments receive theirs from their PDF content.
+- SAP ID: formed by the corresponding year and a 6-digit number. Bills are already named based on it, while payments
+  receive theirs from their PDF content.
 
 - File naming stages for payments:
 
@@ -158,7 +168,8 @@ flowchart TD
 
 ### `service/onedrive/conf/config`
 
-This file controls how OneDrive-For-Linux behaves, what it syncs, how often, and how the local mirror is kept in line with SharePoint. Its contents are the following:
+This file controls how OneDrive-For-Linux behaves, what it syncs, how often, and how the local mirror is kept in line
+with SharePoint. Its contents are the following:
 
 | Setting               | Description                                                                                                                                                            |
 |-----------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -187,11 +198,13 @@ It defines two services, which have healthchecks to ensure they are working prop
 ### Local dev setup
 
 1. Install dependencies:
+
    ```bash
    make install
    ```
 
 2. Run the pipeline:
+
    ```bash
    make run CMD=""
    ```
@@ -213,15 +226,21 @@ It defines two services, which have healthchecks to ensure they are working prop
 ## 8. Testing
 
 - In order to run the test suite, simply run the command `make test` on console inside the environment.
-- Instead of using remote calls, we use mock calls to the different services in order to do relevant tests, since local files are not the source of truth of the project. The objective of this testing strategy is to follow the architecture structure.
+- Instead of using remote calls, we use mock calls to the different services in order to do relevant tests, since
+  local files are not the source of truth of the project. The objective of this testing strategy is to follow the
+  architecture structure.
 
 ---
 
 ## 9. Known limitations
 
 > [!CAUTION]
-> - Bill deletion after merge is irreversible. Depending on future needs, we might move deleted items to the trash instead of a direct deletion.
-> - Local mirror lag relative to SharePoint. Since OneDrive-For-Linux takes minutes to read, check, and download new content and erase the ones not mirrored in SharePoint, the process could incur some syncing lag. However, this pipeline is designed to be run once every few days, so it should have ample time to sync before each full run.
+>
+> - Bill deletion after merge is irreversible. Depending on future needs, we might move deleted items to the trash
+>   instead of a direct deletion.
+> - Local mirror lag relative to SharePoint. Since OneDrive-For-Linux takes minutes to read, check, and download new
+>   content and erase the ones not mirrored in SharePoint, the process could incur some syncing lag. However, this
+>   pipeline is designed to be run once every few days, so it should have ample time to sync before each full run.
 > - No network timeouts on HTTP calls yet.
 
 ---
