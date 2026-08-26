@@ -23,7 +23,7 @@ docs/
 properdocs.yml
 requirements.txt
 .github/workflows/
-└── deploy-docs.yml     # Build + deploy to GitHub Pages
+└── docs.yml            # Build, lint (markdownlint) + deploy to GitHub Pages
 ```
 
 ## Local development

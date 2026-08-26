@@ -1,4 +1,4 @@
-# CLAUDE.md — template-docs
+# CLAUDE.md — docs-template
 
 This is the **upstream** documentation repo for ICIQ-DMP projects.
 It is forked to create per-project docs repos.
@@ -8,28 +8,28 @@ It is forked to create per-project docs repos.
 **Organization:** ICIQ-DMP (github.com/iciq-dmp, pages at ICIQ-DMP.github.io)
 
 **Projects with docs:**
-- `imarina` → `iciq-dmp/imarina-docs` → ICIQ-DMP.github.io/imarina
+- `imarina-load-researchers` → `iciq-dmp/imarina-load-researchers-docs` → ICIQ-DMP.github.io/imarina-load-researchers
 - `justicier` → `iciq-dmp/justicier-docs` → ICIQ-DMP.github.io/justicier
 - `justifactu` → `iciq-dmp/justifactu-docs` → ICIQ-DMP.github.io/justifactu
 
 **Source code repos** (separate from docs repos, contain docstrings):
-- `iciq-dmp/imarina`, `iciq-dmp/justicier`, `iciq-dmp/justifactu`
+- `iciq-dmp/imarina-load-researchers`, `iciq-dmp/justicier`, `iciq-dmp/justifactu`
 
 ## Architecture
 
 ```
-template-docs (this repo, upstream)
-    └── forked to: imarina-docs, justicier-docs, justifactu-docs
+docs-template (this repo, upstream)
+    └── forked to: imarina-load-researchers-docs, justicier-docs, justifactu-docs
                        │
                        │ CI workflow checks out source repo at build time
                        ▼
-              source/   (cloned from iciq-dmp/PROJECT)
+              source/   (cloned from ICIQ-DMP/PROJECT)
                        │
                        ▼
               mkdocstrings reads docstrings → generates reference/
 ```
 
-Each docs repo publishes to GitHub Pages via the `deploy-docs.yml` workflow.
+Each docs repo publishes to GitHub Pages via the `docs.yml` workflow.
 
 ## Information Architecture (Diataxis)
 
@@ -61,15 +61,22 @@ All pinned in `requirements.txt`.
 | `properdocs.yml` | ProperDocs config; top block is project-specific, rest is common |
 | `requirements.txt` | Python dependencies for the build |
 | `docs/gen_ref_pages.py` | Walks `source/` and emits one .md per Python module |
-| `.github/workflows/deploy-docs.yml` | Builds + deploys to GitHub Pages |
+| `.github/workflows/docs.yml` | Build + markdownlint + deploy to GitHub Pages |
 
 ## Forking a new project
 
-1. Fork to `iciq-dmp/PROJECT-docs`
-2. Edit the PROJECT-SPECIFIC block in `properdocs.yml` (site_name, site_url, extra.source_repo)
-3. Edit `docs/index.md`
-4. Enable Pages in repo settings → source: GitHub Actions
-5. Push → CI deploys
+1. Fork to `ICIQ-DMP/PROJECT-docs`
+2. **Enable GitHub Actions for the fork**: open the new fork's Actions tab
+   in a browser and click "I understand my workflows, go ahead and enable
+   them." GitHub disables Actions on every fork by default, silently — no
+   error, no failed run, `docs.yml` just never triggers on push until this
+   is done, and there's no API/CLI way to do it. This is exactly what left
+   `imarina-load-researchers-docs` unpublished for months. Do this first.
+3. Edit the PROJECT-SPECIFIC block in `properdocs.yml` (site_name, site_url, extra.source_repo)
+4. Edit `docs/index.md`
+5. Enable Pages in repo settings → source: GitHub Actions (or
+   `POST /repos/ICIQ-DMP/PROJECT-docs/pages` with `{"build_type": "workflow"}`)
+6. Push → CI builds, lints and deploys
 
 ## Syncing upstream changes into a fork
 

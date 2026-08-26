@@ -38,9 +38,6 @@ nav = mkdocs_gen_files.Nav()
 
 for src_root in _src_roots:
     for path in sorted(src_root.rglob("*.py")):
-        if any(part.startswith(("_", "test_", "setup", "conf")) for part in path.parts):
-            continue
-
         module_path = path.relative_to(src_root).with_suffix("")
         doc_path = path.relative_to(src_root).with_suffix(".md")
         full_doc_path = ref_root / doc_path
@@ -51,10 +48,12 @@ for src_root in _src_roots:
             parts = parts[:-1]
             doc_path = doc_path.with_name("index.md")
             full_doc_path = ref_root / doc_path
-        elif parts[-1].startswith("_"):
-            continue
 
         if not parts:
+            continue
+
+        # Skip private modules, test files, and setup scripts (filter on resolved parts, not raw path)
+        if any(part.startswith(("_", "test_", "setup", "conf")) for part in parts):
             continue
 
         nav[parts] = doc_path.as_posix()
