@@ -8,9 +8,9 @@ It is forked to create per-project docs repos.
 **Organization:** ICIQ-DMP (github.com/iciq-dmp, pages at ICIQ-DMP.github.io)
 
 **Projects with docs:**
-- `imarina-load-researchers` → `iciq-dmp/imarina-load-researchers-docs` → ICIQ-DMP.github.io/imarina-load-researchers
-- `justicier` → `iciq-dmp/justicier-docs` → ICIQ-DMP.github.io/justicier
-- `justifactu` → `iciq-dmp/justifactu-docs` → ICIQ-DMP.github.io/justifactu
+- `imarina-load-researchers` → `ICIQ-DMP/imarina-load-researchers-docs` → ICIQ-DMP.github.io/imarina-load-researchers-docs
+- `justicier` → `ICIQ-DMP/justicier-docs` → ICIQ-DMP.github.io/justicier-docs
+- `justifactu` → `ICIQ-DMP/justifactu-docs` → ICIQ-DMP.github.io/justifactu-docs
 
 **Source code repos** (separate from docs repos, contain docstrings):
 - `iciq-dmp/imarina-load-researchers`, `iciq-dmp/justicier`, `iciq-dmp/justifactu`
