@@ -138,6 +138,58 @@ flowchart TD
 | General log                | `_output/FACTURES+PAGAMENTS/sap.year + FolderName.YEAR_FOLDER_SUFFIX/QA_ERRORS` | `%Y-%m-%d_%H-%M-%S`                         | `2026-09-02_09-51-52.log`           |
 | QA log                     | `_output/FACTURES+PAGAMENTS/sap.year + FolderName.YEAR_FOLDER_SUFFIX/QA_ERRORS` | `%Y-%m-%d_%H-%M-%S_qa_report`               | `2026-09-02_09-51-52_qa_report.log` |
 
+### 5.1 Extracting the SAP ID from a bank payment PDF
+
+Inside the payment PDF, the SAP ID sits next to a fixed marker: `Fra. <SAP ID>` (e.g. `Fra. 2025003695`). The parser
+(`bills.py::parse_sap_id_from_bill`) looks for that marker with the regex `(Fra\.?\s+)` followed by a 4-digit year and
+a 6-digit sequence — the period is optional and the whitespace is `\s+` (matches spaces *and* newlines), which is what
+lets a single pattern cover both formats seen in practice:
+
+| Bank source             | Marker as it appears in the PDF                                                   | Notes                                                                                                                                                               |
+|-------------------------|-----------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| BBVA, before 27/04/2026 | `Fra. 2025003695` (period + space)                                                | Original format                                                                                                                                                     |
+| BBVA, from 27/04/2026   | `Fra` on one line, `2025003695` on the next (no period, newline instead of space) | BBVA changed their statement layout; `\s+` already matches the newline and `\.?` already makes the period optional, so this format is covered without a code change |
+| Sabadell                | `Fra. 2025000549` (period + space)                                                | Same format as BBVA's original                                                                                                                                      |
+
+The resulting output naming (`{sap_id}-P.pdf`, hyphen not underscore) is already covered by the "Payment file renaming"
+row in the table above.
+
+### 5.2 Bill naming (Docuware)
+
+Bills are downloaded from Docuware already named `F {sap_id}` (note the space after `F`) —
+`bills.py::parse_bill_filename` matches that exact shape. Since 20/05/2025, bills entering Docuware get the SAP
+document number written into the filename directly when the document is accounted for, replacing the older manual
+process (scan the paper bill, split the PDF, name it by hand). Bills logged before that date were retroactively
+renamed to the same convention as a one-off cleanup.
+
+> [!NOTE]
+> Downloading bills from Docuware is **not automated yet** — it's currently a manual, roughly-weekly step. Automating
+> it (nightly, or timed to coincide with the bank payment download) is a planned follow-up, not yet scheduled.
+
+### 5.3 Matching and merging
+
+A bill (`F {sap_id}`) and a payment (`{sap_id}-P`) are matched purely on a shared SAP ID — `merge_bills_and_payments`
+builds a payment map keyed by SAP ID and looks up each bill against it. When both exist, they're merged **bill first,
+then payment** into the single fused PDF named per the "Fused bill and payment pdf" row above.
+
+> [!NOTE]
+> The original process description calls for deleting *both* source files after a successful merge — the bill and the
+> bank payment PDF. The current implementation deletes the bill but only **renames** the payment (appending
+> `_merged`) rather than deleting it, keeping it as a lightweight audit trail of which payment file produced which
+> merge. Flagging this as a divergence from the original spec worth confirming is intentional, not an oversight.
+
+> [!WARNING]
+> The original process notes describe payments being consolidated into a distinct `_input/-stages/1/Pagaments` folder
+> after renaming, before the merge step. That doesn't match the SharePoint folder layout documented above, where
+> renaming happens in place under `Remeses` with no separate consolidation folder. Flagging the discrepancy rather
+> than resolving it here — worth checking which one is current.
+
+### 5.4 What doesn't get matched
+
+A bill with no matching payment isn't necessarily an error — it likely belongs to a payment method handled outside
+this flow: card payments, travel expenses, direct debits (*domiciliacions*), etc. Those go through a separate "own
+treatment" process (Phase 3 — see `phase3_credit_cards.md`) rather than the bank-remittance matching described here.
+
 ---
 
 ## 6. Configuration
@@ -249,17 +301,20 @@ It defines two services, which have healthchecks to ensure they are working prop
 >   content and erase the ones not mirrored in SharePoint, the process could incur some syncing lag. However, this
 >   pipeline is designed to be run once every few days, so it should have ample time to sync before each full run.
 > - No network timeouts on HTTP calls yet.
-
+> - Bill ingestion from Docuware is still a manual, weekly step (see [§5.2](#52-bill-naming-docuware)) — not yet part
+>   of the automated pipeline.
 ---
 
 ## 10. Glossary
 
-| Term           | Definition                                                                                                                                                                                                                                    |
-|----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Factura**    | A bill. It's a PDF document containing an individual bill assigned to a specific transaction. It comes with its SAP ID already put in the name, and is located in the `FACTURES` folder in the SharePoint folder structure.                   |
-| **Remesa**     | A batch of payments. Each remesa contains an amount of payments, sorted by bank and month of the year. They are named initially by the bank that expedites them.                                                                              |
-| **Justificar** | To justify. The act of assigning the appropriate bill to each payment, thus justifying each expense with an external document.                                                                                                                |
-| **SAP ID**     | The unique identification number assigned to each entry on the SAP platform. It is the indicator that correlates each bill with its payment.                                                                                                  |
-| **QA report**  | Document generated at the end of each run that contains all the information on the documents that didn't pass correctly through the pipeline, be it either a wrongly-named bill or a payment without a correct SAP ID inside, amongst others. |
-| **Remote**     | That which happens outside the current physical system, such as external services like SharePoint or the mailing API connection.                                                                                                              |
-| **Local**      | That which happens on the current physical system, like the main execution and the Docker containers that host the downloaded data from SharePoint.                                                                                           |
+| Term                        | Definition                                                                                                                                                                                                                                    |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Factura**                 | A bill. It's a PDF document containing an individual bill assigned to a specific transaction. It comes with its SAP ID already put in the name, and is located in the `FACTURES` folder in the SharePoint folder structure.                   |
+| **Remesa**                  | A batch of payments. Each remesa contains an amount of payments, sorted by bank and month of the year. They are named initially by the bank that expedites them.                                                                              |
+| **Justificar**              | To justify. The act of assigning the appropriate bill to each payment, thus justifying each expense with an external document.                                                                                                                |
+| **SAP ID**                  | The unique identification number assigned to each entry on the SAP platform. It is the indicator that correlates each bill with its payment.                                                                                                  |
+| **QA report**               | Document generated at the end of each run that contains all the information on the documents that didn't pass correctly through the pipeline, be it either a wrongly-named bill or a payment without a correct SAP ID inside, amongst others. |
+| **Remote**                  | That which happens outside the current physical system, such as external services like SharePoint or the mailing API connection.                                                                                                              |
+| **Local**                   | That which happens on the current physical system, like the main execution and the Docker containers that host the downloaded data from SharePoint.                                                                                           |
+| **Docuware**                | The external document-management system bills are downloaded from. Currently a manual step (§5.2); not yet wired into the automated pipeline.                                                                                                 |
+| **Own treatment / Phase 3** | The separate process for payments that don't match a bill in this flow — card payments, travel expenses, direct debits (*domiciliacions*). Documented in `phase3_credit_cards.md`.                                                            |
