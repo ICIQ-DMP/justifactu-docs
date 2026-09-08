@@ -121,15 +121,22 @@ flowchart TD
   ```
 
 - SharePoint folder layout:
-  - `_input`
-    - `FACTURES`
-    - `Remeses`
+  - `_input`, where all input files are. These files never
+    - `FACTURES`, containing bills already properly named after their SAP ID.
+    - `Remeses`, where the original payment files are and where they are renamed according to their SAP ID.
   - `_output`
     - `FACTURES+PAGAMENTS`
       - `2025_FACTURES+PAGAMENTS`
       - `2026_FACTURES+PAGAMENTS`
       - ...
     - `QA`
+
+| Process                    | Output location                                                                 | Naming convention                           | Example                             |
+|----------------------------|---------------------------------------------------------------------------------|---------------------------------------------|-------------------------------------|
+| Payment file renaming      | `_output/Remeses`, original file location                                       | `(?P<year>20\d{2})(?P<sapid>\d{6})-P.pdf`   | `2025000458-P.pdf`                  |
+| Fused bill and payment pdf | `_output/FACTURES+PAGAMENTS/(?P<year>20\{2})_FACTURA+PAGAMENT`                  | `(?P<year>20\d{2})(?P<sapid>\d{6})_F_P.pdf` | `2025000458_F_P.pdf`                |
+| General log                | `_output/FACTURES+PAGAMENTS/sap.year + FolderName.YEAR_FOLDER_SUFFIX/QA_ERRORS` | `%Y-%m-%d_%H-%M-%S`                         | `2026-09-02_09-51-52.log`           |
+| QA log                     | `_output/FACTURES+PAGAMENTS/sap.year + FolderName.YEAR_FOLDER_SUFFIX/QA_ERRORS` | `%Y-%m-%d_%H-%M-%S_qa_report`               | `2026-09-02_09-51-52_qa_report.log` |
 
 ---
 
