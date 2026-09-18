@@ -817,6 +817,82 @@ Authoritative. Read this before changing anything. Decision IDs are stable; a fe
 - **Consequences:** D10 and D12 are withdrawn; the pipeline has no gate stage; correctness rests on
   `subprocess.run(..., check=True)` around each `onedrive` call.
 
+## D24 — Retire `sync_list`; `--single-directory` is the only scope filter
+
+**Context:** _input is retired. sync_list previously listed `/justifactu/_input`
+as the only synced path — an inclusion whitelist. The pipeline now scopes to
+`justifactu/runtime` exclusively via the `--single-directory` CLI flag
+instead.
+
+**Decision:** delete `service/onedrive/conf/sync_list` from the repo
+entirely (`git rm`), not just empty it. `--single-directory` becomes the
+sole scoping mechanism on every onedrive invocation.
+
+**Why:**
+sync_list and --single-directory are independent filters that don't defer
+to each other. With sync_list still listing only `/justifactu/_input`,
+a `--single-directory justifactu/runtime` run logged:
+  "Skipping path - excluded by sync_list config: justifactu/runtime"
+  "Flagging to delete item locally as this is now an unwanted item..."
+  "Deleting local directory: justifactu/runtime"
+followed by a crash (`std.file.FileException`) — onedrive deleted the very
+directory --single-directory was scoping to, then choked trying to
+operate on it afterward. Two filters saying contradictory things doesn't
+degrade gracefully; it actively destroys local data given this config's
+cleanup_local_files=true + bypass_data_preservation=true.
+Also worth noting: leaving sync_list present-but-*empty* isn't a safe
+middle ground either — the analogous skip_file setting has a documented
+bug where an empty (but present) value forces perpetual --resync. Full
+removal is the only option that reliably resolves to "no whitelist active."
+
+**Consequences:** anyone reintroducing a sync_list file for a different
+reason later needs to know it will silently exclude/delete anything not
+listed, even if --single-directory also targets it. Flag this prominently,
+not just in a decision log entry — maybe a comment pointer from
+compose.yml or the onedrive conf directory's README/.gitignore too.
+
+## D25 — CLI-args-driven local paths replace hardcoded Docker paths
+
+**Context:** confdir came from `OD_CONFDIR` env var, defaulting to the
+Docker-only `/onedrive/conf`; sync_dir was hardcoded in
+`service/onedrive/conf/config` to `/onedrive/data`. Neither existed on a
+bare local machine, and running main.py outside Docker failed at startup
+(`Permission denied` trying to create `/onedrive`).
+
+**Decision:** five new arguments.py flags, all defaulting to portable
+paths computed from `ROOT_FOLDER` (`Path(__file__).resolve().parent.parent.parent`),
+overridable via CLI:
+  --onedrive_conf_folder   → passed as --confdir
+  --onedrive_data_folder   → passed as --syncdir (overrides config's sync_dir)
+  --sharepoint_sync_folder → passed as --single-directory (relative to syncdir)
+  --onedrive_logs_folder   → (note if this made it into the subprocess call
+                              or is currently unused — check onedrive_sync.py)
+  --runtime_location       → computed as onedrive_data_folder / sharepoint_sync_folder,
+                              auto-created via parse_directory if missing
+
+**Why:** the previous defaults weren't just inconvenient for testing — they made running
+`main()` outside Docker impossible outright. `confdir` came from `OD_CONFDIR`, defaulting
+to the literal string `/onedrive/conf`; `sync_dir` was hardcoded in
+`service/onedrive/conf/config` to `/onedrive/data`. Both are absolute paths that only
+resolve inside the Docker container's filesystem. Run `main()` on a bare host and `confdir`
+points at a directory that doesn't exist; `onedrive` then tries to create `sync_dir` at
+`/onedrive` — filesystem root — and fails with a plain permission error, since no non-root
+user can create directories there. This wasn't a "slower to test" problem, it was a hard
+blocker: there was no way to exercise the sync path locally at all before this change, only
+inside a container.
+
+Putting these behind CLI flags rather than just fixing the constants in place adds a
+second benefit: a developer testing against disposable mock data
+(rather than the real SharePoint account) can redirect `confdir`/`sync_dir`/the sync
+scope to an isolated sandbox location with one flag, without editing source or
+maintaining a parallel "test" branch of the defaults.
+
+**Consequences:** --confdir and --syncdir must be passed identically on
+every onedrive invocation across the whole run (download and upload
+passes alike) or the local sync-state database has no continuity between
+calls — this isn't optional plumbing, it's required for the delta-sync
+mechanism (see existing Glossary entry for items.sqlite3) to work at all.
+
 ### 11.2 Decisions still open
 
 - **Stage 3 specification.** The credit-card payments step (D22) needs its matching / naming / cleanup rules
