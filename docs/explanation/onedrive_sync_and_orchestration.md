@@ -18,9 +18,11 @@
 
 > [!NOTE]
 > Every design decision, with its rationale and consequences, is in [Section 11, Decision log](#11-decision-log). The
-> decision log is authoritative — if the prose and a decision disagree, the decision wins. The draft artifacts referred
-> to here live in the **source** repo: `Jenkinsfile` (repo root) and `service/agent/dockerfile/Dockerfile`. Both are
-> marked `DRAFT` and are not wired into any running Jenkins job yet.
+> decision log is authoritative — if the prose and a decision disagree, the decision wins. **As of this update, several
+> early decisions (D8, D19) are amended rather than withdrawn: the shape they describe shipped, but not exactly as
+> written — see D26–D31 for what's actually in `develop` today.** The draft artifacts referred to here live in the
+> **source** repo: `Jenkinsfile` (repo root) and `service/agent/dockerfile/Dockerfile`. Both are still marked `DRAFT`
+> and are not wired into any running Jenkins job yet.
 
 ---
 
@@ -29,86 +31,100 @@
 This document explains **how the justifactu pipeline exchanges data with SharePoint**, why the design looks the way it
 does, and what a junior engineer has to build to put it into production.
 
-Read it start to finish. It assumes you have read [phase1_individual_bills.md](phase1_individual_bills.md), which
-describes what the pipeline *does* with the data once it has it.
+Read it start to finish. It assumes you have read
+[phase1_2_individual_bills.md](phase1_2_individual_bills.md), which describes what the pipeline *does* with the data
+once it has it. (Earlier revisions of this document linked to a file named `phase1_individual_bills.md` — that file
+never existed under that name; the real filename has always been `phase1_2_individual_bills.md`. Every link below has
+been corrected.)
 
 The target production deployment is:
 
 - a single Jenkins job, triggered by cron, pinned to one dedicated agent;
-- **no** long-running OneDrive container and **no** Microsoft Graph access;
+- **no** long-running OneDrive container — but, as of commit `d374242`, a direct Microsoft Graph call *is* back in the
+  app, strictly as a download-only fallback for when the OneDrive-for-Linux sync itself fails (see D26, Section 6.5);
 - `python -m justifactu` runs the whole sequence itself: one `onedrive` download, the processing stages, one `onedrive`
   upload.
 
-The current setup — `compose.yml` with a long-running `onedrive` sidecar plus a Graph client inside the app — is the
-starting point we are migrating away from. Section 8 is the migration
-checklist.
+The current setup — `compose.yml` with a long-running `onedrive` sidecar — is still kept for local dev (D18), but is
+**not** the production design described here.
 
 ---
 
 ## 2. Background: one channel to SharePoint
 
-Everything to and from SharePoint goes through **one tool**: [`abraunegg/onedrive`](https://github.com/abraunegg/onedrive)
-(OneDrive-for-Linux). `main()` invokes it **twice per run**, each time as a one-shot sync that does a single direction
-and exits:
+Everything to and from SharePoint goes **primarily** through **one tool**:
+[`abraunegg/onedrive`](https://github.com/abraunegg/onedrive) (OneDrive-for-Linux). `main()` invokes it **twice per
+run**, each time as a one-shot sync that does a single direction and exits:
 
-| Step | Command (run by `main()`) | Direction | Purpose |
+| Step | Command (run by `main()`, via `onedrive_sync.py::run_onedrive_sync`) | Direction | Purpose |
 |---|---|---|---|
-| **1 — download** | `onedrive --confdir /onedrive/conf --sync --download-only --verbose` | SharePoint → local disk | Bring the local `justifactu/_input` copy fully up to date before any stage runs. |
-| **3 — upload** | `onedrive --confdir /onedrive/conf --sync --upload-only --verbose` | local disk → SharePoint | After stages 1–3, make SharePoint match the local tree: upload the new `justifactu/_output`, and propagate the renames and deletions the stages made in `justifactu/_input`. |
+| **1 — download** | `onedrive --confdir <conf> --syncdir <data> --single-directory justifactu/runtime --sync --download-only --cleanup-local-files [--dry-run] --verbose` | SharePoint → local disk | Bring the local `justifactu/runtime` copy fully up to date before any phase runs. |
+| **3 — upload** | `onedrive --confdir <conf> --syncdir <data> --single-directory justifactu/runtime --sync --upload-only [--dry-run] --verbose` | local disk → SharePoint | After the phases, make SharePoint match the local tree: upload the new merged-output folder, and propagate the renames and deletions the phases made under `justifactu/runtime`. |
+
+**The scoped remote directory is `justifactu/runtime`, not a separate `_input`/`_output` pair.** The input folders
+(`FACTURES`/`Remeses`, or their test-mode equivalents under `carpeta_proves` — see D29) and the merged-output folder
+(`_output/FACTURES+PAGAMENTS/...`) all live as subfolders *inside* `justifactu/runtime`, synced as one scope. This
+replaced an earlier design where `_input` and `_output` were synced as two separate top-level entries in a
+`sync_list` file — that file is gone entirely (D24); `--single-directory justifactu/runtime` is now the only scope
+filter, and it covers both input and output in one pass.
 
 ```mermaid
 flowchart LR
-    APP["python -m justifactu (main)<br/>orchestrates: 1 download, 2 stages 1-3, 3 upload"]
+    APP["python -m justifactu (main)<br/>orchestrates: 1 download, 2 phases, 3 upload"]
     OD["OneDrive-for-Linux<br/>one-shot, one direction per call"]
-    LC[(Local tree<br/>/onedrive/data<br/>_input + _output)]
+    GAPI["Microsoft Graph API<br/>download-only fallback (D26)"]
+    LC[(Local tree<br/>onedrive-data-folder<br/>justifactu/runtime/...)]
     SP[(SharePoint<br/>document library)]
 
     APP -- "step 1: invoke download sync" --> OD
+    APP -- "step 1b: ONLY if step 1 raises" --> GAPI
     APP -- "step 3: invoke upload sync" --> OD
     SP -- "step 1: SharePoint to disk" --> OD
-    OD -- "step 1: writes _input" --> LC
-    LC -- "step 2: read _input, write _output, local renames + deletes" --> APP
+    SP -- "step 1b: fallback download" --> GAPI
+    OD -- "step 1: writes runtime/" --> LC
+    GAPI -- "step 1b: writes runtime/" --> LC
+    LC -- "step 2: read bills/payments, write merged output, local renames + deletes" --> APP
     OD -- "step 3: disk to SharePoint" --> SP
     LC -- "step 3: local diff" --> OD
 ```
 
 What this shape means:
 
-- **`python -m justifactu` never touches the network.** Stages 1–3 read and write files under `/onedrive/data` and
-  nothing else — no Graph client, no OAuth token in the app, no per-file API call. Everything the stages "do to
-  SharePoint" they do to the local tree; the upload step carries it across afterwards.
+- **`python -m justifactu` doesn't normally touch the network directly** — stages read and write files under the
+  resolved runtime folder and nothing else, *except* on a download failure, where the Graph fallback (D26) makes one
+  direct API call chain to recover. The upload side has no such fallback: if `onedrive --upload-only` fails, the run
+  fails — there is still only one channel for writing SharePoint.
 - **A one-shot `--sync` is self-verifying.** When the command exits `0`, the local copy is fully reconciled with
-  SharePoint — there is nothing left in flight, because a one-shot sync is not a background process. If it cannot
-  finish, it exits non-zero and `main()` aborts. So there is **no separate "is it fresh yet?" check** anywhere in this
-  design.
-- **SharePoint is written exactly once per run**, by the upload step, after all three stages have completed cleanly. If
-  any stage raises, `main()` never reaches the upload step, so a failed run leaves SharePoint untouched.
-- **The upload step is destructive by nature.** `--upload-only` makes the remote match local within the synced scope:
-  new `_output` files are uploaded; a payment renamed by a stage is uploaded under the new name and the **old name is
-  deleted** on SharePoint (OneDrive has no rename primitive here); a bill deleted locally by stage 2 is **deleted** on
-  SharePoint. See D20. The safeguard is that the download step (with `cleanup_local_files`, D21) makes
-  the local `_input` a faithful mirror first, so at upload time the only differences are the ones the stages made on
-  purpose.
-- **One credential.** OneDrive-for-Linux authenticates OAuth2 **on behalf of a user** — a `refresh_token` obtained once
-  through an interactive browser login (Section 6.4). The old Graph app credentials
-  (`CLIENT_ID`, `CLIENT_SECRET`, `TENANT_ID`) are retired.
+  SharePoint. If it cannot finish, it exits non-zero; `run_onedrive_sync` wraps that into a `MainCriticalError`, which
+  `main()` either routes to the Graph fallback (download only) or lets abort the run (upload).
+- **SharePoint is written exactly once per run**, by the upload step, after `run_all_phases()` has completed cleanly.
+  If any phase raises, `main()` never reaches the upload step, so a failed run leaves SharePoint untouched.
+- **The upload step is destructive by nature.** `--upload-only` makes the remote match local within the synced scope.
+  See D20. The safeguard is that the download step (with `--cleanup-local-files`, D21) makes the local tree a
+  faithful mirror first, so at upload time the only differences are the ones the phases made on purpose.
+- **Two credentials now exist for the download side, not one** — OneDrive-for-Linux's own delegated-user OAuth token
+  (Section 6.4), *and* a second, independent Microsoft Graph app-only credential set
+  (`CLIENT_ID`/`CLIENT_SECRET`/`TENANT_ID`) used only by the fallback path (D26). This is a deliberate, documented
+  regression from the original "one credential" goal — see D26 for why, and for the operational cost of carrying two
+  credential sets instead of one.
 
 ---
 
 ## 3. Problem statement
 
-The `_input` folder on SharePoint is large (hundreds of GB). The design has to answer three questions:
+The remote synced tree is large (hundreds of GB in production). The design has to answer three questions:
 
 1. **State between runs.** How does the OneDrive client run, and how are its downloaded files, its database and its
    auth token kept between runs so that only the first run is slow?
 2. **Exposure.** The upload step makes SharePoint match local. How do we make sure it only ever propagates *intended*
    changes, never a corruption or a half-finished run?
-3. **Stage ordering.** Stages 1–3 modify `_input` during a run. Do they need any synchronisation between them?
+3. **Stage ordering.** Do phases 1–2 (and, eventually, phase 3) need any synchronisation between them?
 
-Question 3 has a short answer: **no.** `rename_payments` (stage 1), `merge_bills_and_payments` (stage 2) and the
-credit-card payments step (stage 3) run in the **same Python process**, one after another, over the **same local
-directory**. Each stage sees the previous stage's changes because they are already on disk. The only things that touch
-the network are the two `onedrive` calls, and they run strictly before stage 1 and strictly after stage 3.
+Question 3's answer is still **no.** `rename_payments` (phase 1) and `merge_bills_and_payments` (phase 2) run in the
+**same Python process**, one after another, over the **same local directory**, via `process.py::run_all_phases`'s
+`_build_phase_map` dispatch. Each phase sees the previous phase's changes because they are already on disk. The only
+things that touch the network are the two `onedrive` calls (plus, conditionally, the Graph fallback), and they run
+strictly before phase 1 and strictly after the phases complete.
 
 ---
 
@@ -120,20 +136,35 @@ The client keeps its state in a SQLite database (`items.sqlite3`) in its config 
 process may use a config directory at a time.** This design runs `onedrive` twice per run but **sequentially** — the
 download exits before stage 1, stage 3 exits before the upload. There is never a second live `onedrive` process.
 
-### 4.2 The authorization needs a human, exactly once
+### 4.2 The authorization needs a human, but through a dedicated bootstrap command now
 
-OneDrive-for-Linux authenticates as a **user**. The first authorization requires opening a URL in a browser, signing in
-to the SharePoint account, and pasting the redirect URL back. That writes a `refresh_token` file. Everything after that
-is headless: the client exchanges the refresh token for short-lived access tokens on its own. This is now the **only**
-credential the pipeline needs for SharePoint.
+The original design assumed a human runs `onedrive --confdir ...` directly, interactively, once. **That's no longer
+how it works.** `main.py` now has a dedicated `--auth` flag (`args.auth and args.location == InputLocation.SHAREPOINT`)
+that calls `onedrive_sync.py::run_onedrive_auth(confdir, data_folder)` — a separate function from the sync wrapper,
+shelling out to `onedrive --confdir <confdir> --syncdir <data_folder> --verbose` with **no** `--single-directory`,
+`--sync`, or `--monitor` flags at all. On a `confdir` with no existing refresh token, this drives the interactive
+OAuth flow, persists the token, and the program exits `0` immediately — no file listing, no transfer. See D27 for the
+full history (this replaced an earlier version that scoped a real `--sync --download-only` pass to a dedicated empty
+remote folder, which no longer exists).
+
+**Known limitation, accepted as intentional:** re-running `--auth` after a token already exists for that `confdir`
+now exits non-zero ("missing switches"), instead of the old design's harmless no-op — the fast-fail path in
+OneDrive-for-Linux only triggers when a token is already present. `--auth` is meant to be run exactly once per new
+`confdir`.
+
+Everything after the bootstrap is headless, same as originally designed: the client exchanges the refresh token for
+short-lived access tokens on its own.
 
 ### 4.3 The refresh token has a sliding expiry
 
-Microsoft refresh tokens for this flow last roughly **90 days**, and the clock resets every time the token is used. As
-long as the pipeline runs at least once inside any 90-day window, the token lives indefinitely. If it goes dormant
-longer, a human must re-authorize. The token is also revoked, outside our control, by: the account password changing; a
-tenant admin revoking sessions or changing a Conditional Access / MFA policy; the "OneDrive Client for Linux"
-enterprise app being disabled. Any of these stops **both** directions — there is no Graph fallback.
+Microsoft refresh tokens for this flow last roughly **90 days**, and the clock resets
+every time the token is used. As long as the pipeline runs at least once inside any 90-day window, the token lives
+indefinitely. If it goes dormant longer, a human must re-authorize via `--auth`. The token is also revoked, outside
+our control, by: the account password changing; a tenant admin revoking sessions or changing a Conditional Access /
+MFA policy; the "OneDrive Client for Linux" enterprise app being disabled. **Unlike the original design, this no
+longer stops both directions outright for the download side** — a revoked OneDrive token still triggers the Graph
+fallback (D26), which has its own, independent credential set. The upload side has no fallback and still stops
+completely if its sync fails.
 
 ### 4.4 The first run is slow; later runs are fast
 
@@ -181,25 +212,29 @@ persists, that cost is paid once.
 
 ```mermaid
 flowchart TD
-    CRON["cron ~ 03:00 daily"] --> CTRL["Jenkins controller"] --> PY
+    CRON["cron (target, not yet configured)"] --> CTRL["Jenkins controller"] --> PY
 
-    subgraph Agent["Dedicated agent (pinned by label)"]
+    subgraph Agent["Dedicated agent (pinned by label, target — not yet configured)"]
         PY["python -m justifactu (main)<br/>orchestrates the whole run"]
-        BIN["onedrive binary<br/>pinned version, baked into the image<br/>one-shot, one direction per call"]
-        CONF[("conf volume /onedrive/conf<br/>config, sync_list,<br/>refresh_token, items.sqlite3")]
-        DATA[("data volume /onedrive/data<br/>justifactu/_input and justifactu/_output")]
+        BIN["onedrive binary<br/>installed via OBS apt repo (amended D6)"]
+        GAPI["Graph API client<br/>download fallback only (D26)"]
+        CONF[("conf volume<br/>config, refresh_token, items.sqlite3<br/>drive_id injected per call, not stored (D28)")]
+        DATA[("data volume<br/>justifactu/runtime/... (bills, payments, merged output)")]
     end
 
     SP[(SharePoint<br/>document library)]
 
     PY -- "step 1: invoke download sync, wait for exit" --> BIN
-    PY -- "step 2: run stages 1-3 (local filesystem only)" --> DATA
+    PY -- "step 1b: on failure only" --> GAPI
+    PY -- "step 2: run phases (local filesystem only)" --> DATA
     PY -- "step 3: invoke upload sync, wait for exit" --> BIN
     BIN -- "reads / writes sync state" --> CONF
-    BIN -- "step 1: writes _input to disk" --> DATA
+    BIN -- "step 1: writes runtime/ to disk" --> DATA
     SP -- "step 1: SharePoint to disk" --> BIN
+    SP -- "step 1b: fallback download" --> GAPI
+    GAPI -- "step 1b: writes runtime/ to disk" --> DATA
     BIN -- "step 3: disk to SharePoint" --> SP
-    DATA -- "step 3: local diff (_output, renames, deletes)" --> BIN
+    DATA -- "step 3: local diff" --> BIN
 ```
 
 Key points:
@@ -257,32 +292,23 @@ version triggers a re-scan.
 
 ### 6.3 The two persistent volumes
 
-Both must survive between builds as Docker volumes on the pinned agent.
 
 | Volume | Container path | Contents | If you lose it |
 |---|---|---|---|
-| **conf** | `/onedrive/conf` | `config`, `sync_list`, `refresh_token`, `items.sqlite3` (+ `-wal`, `-shm`), `.resume` state | Human re-authorization **and** a full re-scan / re-download |
-| **data** | `/onedrive/data` | `justifactu/_input` (hundreds of GB) **and** `justifactu/_output` (a run's results, until the upload step sends them) | A full multi-hour re-download of `_input` (auth survives) |
+| **conf** | `/onedrive/conf` | `config`, `refresh_token`, `items.sqlite3` (+ `-wal`, `-shm`), `.resume` state | Human re-authorization (`--auth`) **and** a full re-scan / re-download |
+| **data** | `/onedrive/data` | `justifactu/runtime/...` — bills, payments (or their `carpeta_proves`-nested test equivalents), and the merged output | A full re-download (auth survives) |
 
-`config` keys (from `service/onedrive/conf/config`) in this model:
+`config` keys (from `service/onedrive/conf/config`) in the current model:
 
 | Key | Keep? | Note |
 |---|---|---|
-| `sync_dir` | Yes | `/onedrive/data`. `_input` and `_output` both live under it so the upload step can see `_output`. |
-| `drive_id` | Yes | Graph identifier of the SharePoint library. Must match exactly. |
-| `cleanup_local_files` | **Yes** (`"true"`) | In `--download-only` mode the client does **not** apply remote deletions locally unless this is set. Keeping it makes local `_input` a true mirror — otherwise a file deleted on SharePoint would linger locally and the upload step would re-upload it. See D21. |
-| `bypass_data_preservation` | Yes (`"true"`) | On the download step, let the remote version overwrite a stale local file instead of writing a conflict copy — fine because `_input` is reconstructible, and it lets a run self-heal after a failed previous upload. |
-| `resync_auth` | Yes (`"true"`) | Auto-accepts a `--resync` prompt so a client-version bump does not hang a headless run. |
-| `download_only` | **Remove** | Was `"true"`. Direction is now chosen per call with `--download-only` / `--upload-only`; a static `download_only` would make the upload step a no-op. |
-| `monitor_interval` | **Remove** | Only used by `--monitor`. There is no monitor. |
-
-`sync_list` must cover **both** subtrees (the current file only has the first line):
-
-```text
-/justifactu/_input
-/justifactu/_output
-```
-
+| `sync_dir` | Physically present, but dead | `--syncdir` on every invocation overrides it regardless of what's written here. |
+| `drive_id` | **No longer a static value** | Placeholder `""` in the git-tracked file. Resolved per-call from the `DRIVE_ID` Vault secret and written into `config` immediately before each `onedrive` invocation, then erased again in a `finally` block after. See D28. |
+| `cleanup_local_files` | **Removed from config; now a per-call CLI flag** | `--cleanup-local-files` is appended only on the *download* call, computed in code, not read from this file. |
+| `bypass_data_preservation` | Not present in the current config — **unconfirmed whether this is still set**; verify against the live `service/onedrive/conf/config` before relying on this row. | |
+| `sync_list` | **Deleted entirely** (D24) | `--single-directory justifactu/runtime` is the sole scope filter now. |
+| `download_only` | Not present — correctly removed per the original D21 reasoning. | |
+| `monitor_interval` | Not present — correctly removed; no monitor is used. | |
 ### 6.4 Authentication (one token)
 
 ```mermaid
@@ -293,7 +319,7 @@ sequenceDiagram
     participant MS as Microsoft identity
     participant V as conf volume
 
-    H->>OD: run `onedrive --confdir /onedrive/conf` (interactive, one time)
+    H->>OD: run `justifactu --auth` (interactive, one time)
     OD->>H: prints login URL
     H->>B: open URL, sign in as the SharePoint service account, approve
     B->>H: redirect URL containing an auth code
@@ -330,25 +356,45 @@ Operational rules:
 
 ```python
 def main() -> None:
-    confdir = os.environ.get("OD_CONFDIR", "/onedrive/conf")
+    qa_report_path = ADMIN_LOG_FOLDER / (NOW + "_qa_report.log")
+    configure_logging_from_settings(qa_files_log_file=qa_report_path)
 
-    # step 1 — one-shot download; blocks until SharePoint -> disk is fully reconciled.
-    # subprocess.run([... "--sync", "--download-only", "--verbose"], check=True)
-    # non-zero exit -> raise -> the whole run fails here, before any stage.
-    run_onedrive_sync(confdir, direction="download")
+    args = process_parse_arguments()
+    if args.phase is not None:
+        run_phase(args.phase, args.runtime_location, args.mode)   # isolated single-phase test path — see D29
+        return                                                     # no sync, no QA mail, no --auth check at all
 
-    # step 2 — all local, no network
-    freshly_renamed = rename_payments(payments_folder)                     # stage 1
-    merge_bills_and_payments(bills_folder, payments_folder, output_folder,  # stage 2
-                             delete_processed=True, freshly_renamed_payments=freshly_renamed)
-    process_credit_card_payments(...)                                      # stage 3  (not yet in process.py)
-    write_qa_report(output_folder / "QA_ERRORS")
+    confdir = args.onedrive_conf_folder
 
-    # step 3 — one-shot upload; pushes _output and propagates the local renames/deletes in _input.
-    # optional: run once with --dry-run first and log the plan, so a mass-deletion diff is visible.
-    run_onedrive_sync(confdir, direction="upload")
+    try:
+        if args.auth and args.location == InputLocation.SHAREPOINT:
+            run_onedrive_auth(confdir, data_folder=args.onedrive_data_folder)
+            exit(0)
 
-    # finally: e-mail the QA report + run log (runs on success and on failure)
+        try:
+            run_onedrive_sync(confdir, direction="download", single_dir=args.sharepoint_sync_folder,
+                               data_folder=args.onedrive_data_folder, dry_run=args.dry_run)
+        except MainCriticalError as e:
+            # Graph API fallback — download only, see D26. No equivalent exists for the upload call below.
+            token_manager, _, drive_id = connect_sharepoint()
+            download_input_folder(token_manager, drive_id, args.sharepoint_sync_folder, args.runtime_location)
+
+        run_all_phases(args.runtime_location, args.mode)           # Mode threaded through — see D29
+
+        qa_folder = qa_errors_folder(merged_output_folder(args.runtime_location))
+        qa_folder.mkdir(parents=True, exist_ok=True)
+        copy_file(qa_report_path, qa_folder)
+        copy_file(ADMIN_LOG_FOLDER / (NOW + ".log"), qa_folder)
+
+        run_onedrive_sync(confdir, direction="upload", single_dir=args.sharepoint_sync_folder,
+                           data_folder=args.onedrive_data_folder, dry_run=args.dry_run)
+
+    except MainCriticalError as e:
+        log.critical(e)
+        exit(1)                                                    # fixed in ea6b710 — see D32
+
+    finally:
+        send_qa_report_mail(...)                                   # always runs, success or failure
 ```
 
 **Jenkinsfile (repo root — to be rewritten to this shape):**
@@ -474,6 +520,14 @@ flowchart TD
     R -- 0 --> OK([build SUCCESS])
     R -- non-zero --> PF["post failure: emailext -> digitalitzacio@iciq.es"] --> KO([build FAILURE])
 ```
+### 7.1a The isolated `--phase` path (not in the original design)
+
+`justifactu --phase {1,2,3} [--mode {test,prod}]` bypasses the entire diagram above. `main()` checks `args.phase`
+*before* touching `confdir`, the `--auth` branch, or either `onedrive` call, and returns immediately after running
+just that one phase via `process.py::run_phase`. No sync, no QA-report email (the `return` happens before entering
+the `try`/`finally` that sends it), no `--auth` check. This exists purely to exercise one phase's logic against
+whatever is already present locally, without touching SharePoint at all. See D29 for the `--mode` flag that decides
+which folder names that one phase reads.
 
 ### 7.2 Step by step
 
@@ -510,49 +564,49 @@ code of record is `src/justifactu/process.py`.
 
 ### 8.1 Source repo (`iciq-dmp/justifactu`)
 
-1. **Remove the Microsoft Graph path.** Delete the remote calls and their modules: `_connect_sharepoint`,
-   `download_input_folder`, `build_file_url_map`, `require_sharepoint_connection`, `upload_folder_recursive`
-   (`main.py`); `rename_file_remote`, `delete_file_remote` (`process.py` / `sharepoint.py`); `token_manager.py`; the
-   Graph half of `sharepoint.py`. Stages 1–2 keep their **local** file rename/delete and stop making remote calls.
-   Drop the `--location` / `--download-input` switches — the app is filesystem-only now, always reading
-   `sync_dir/justifactu/_input` and writing `sync_dir/justifactu/_output`.
-2. **Add an `onedrive` wrapper.** A small helper, e.g. `run_onedrive_sync(confdir, direction)` →
-   `subprocess.run(["onedrive", "--confdir", confdir, "--sync", f"--{direction}-only", "--verbose"], check=True)`.
-   Read `confdir` from `OD_CONFDIR` (default `/onedrive/conf`).
-3. **Wire it into `main()`** exactly as Section 6.5 shows: download wrapper call →
-   stages 1–3 → upload wrapper call → QA e-mail in `finally`. A non-zero exit from either wrapper call must abort the
-   run (`check=True` does this).
-4. **Implement stage 3** — `process_credit_card_payments(...)` in `process.py`, called from `main()` right after
-   `merge_bills_and_payments`, writing results under `_output` and doing any `_input` renames/deletes locally. Its
-   matching/naming rules need to be written down first (open item, Section 11.2).
+1. ~~Remove the Microsoft Graph path entirely~~ — **superseded.** Graph is back as a download-only fallback (D26).
+   `token_manager.py` is live again (it's the fallback's only consumer of `TokenManager`). `sharepoint.py` was
+   recreated with a **narrower** surface than before: `get_site_id`, `get_drive_id`, `list_folder_contents`,
+   `download_file`, `download_folder_recursive`, `download_input_folder`, `connect_sharepoint` — no
+   `rename_remote_item`/`delete_remote_item`/`upload_folder_recursive` at all; the upload path remains
+   `onedrive`-only, with no Graph equivalent. ✅ `--download-input` was removed (`aa7dd21`). `--location` was **not**
+   removed — it's still a real flag, gating the `--auth` branch.
+2. ✅ **Done.** `onedrive_sync.py::run_onedrive_sync(confdir, direction, single_dir, data_folder, dry_run)` exists,
+   plus the separate `run_onedrive_auth(confdir, data_folder)` for the bootstrap (D27), and
+   `_write_drive_id`/`erase_drive_id` for per-call secret injection (D28).
+3. ✅ **Done**, but not exactly as drafted — see Section 6.5 for the real shape, including the `--phase` early-return
+   and `--auth` branch that weren't part of the original plan at all.
+4. ⬜ **Still open.** `Phase.PHASE_3` exists in `defines.py` and is reachable via `--phase 3` for isolated testing, but
+   its implementation is `process.py::mock_phase3()` — a placeholder that just logs a message. It's deliberately
+   excluded from `FULL_RUN_PHASES`, so a full (non-`--phase`) run never reaches it. The real credit-card-payments
+   logic described in D22 still needs its matching/naming rules written down before implementation — see Section
+   11.2 for the still-open items, now including this one explicitly.
 
 ### 8.2 OneDrive config (`service/onedrive/conf/`)
 
-1. In `config`: **remove** `download_only` and `monitor_interval`; **keep** `cleanup_local_files = "true"`,
-   `bypass_data_preservation = "true"`, `resync_auth = "true"`, `sync_dir`, `drive_id`.
-2. In `sync_list`: **add** the line `/justifactu/_output`.
+1. ✅ **Done**, via a different mechanism than drafted: rather than hand-editing `config`, the relevant flags
+   (`--cleanup-local-files`, `--dry-run`) are now computed per-call in `onedrive_sync.py`, not static config keys.
+   `drive_id` resolution is also per-call now (D28), not a static key either.
+2. ✅ **Done**, also via a different mechanism: `sync_list` wasn't edited to add a second path — it was **deleted
+   entirely** (D24), replaced by `--single-directory justifactu/runtime` as the sole scope filter, which already
+   covers both the input folders and the merged-output folder in one pass.
 
 ### 8.3 Infrastructure
 
-1. **Agent image** — finalise `service/agent/dockerfile/Dockerfile` (multi-stage `onedrive` build, Section 6.2). Set
-   `ONEDRIVE_VERSION` to the confirmed current `2.5.x` tag. Build and publish.
-2. **Volumes** — create the two named Docker volumes on the chosen agent host; mount them at `/onedrive/conf` and
-   `/onedrive/data` in the agent container. Copy the existing `config` and `sync_list` (both edited per 8.2) into the
-   `conf` volume.
-3. **Jenkins job** — rewrite `Jenkinsfile` to the shape in Section 6.5. Configure a pipeline-from-SCM job: branch
-   `master`, pinned to the agent label, cron trigger only, SCM-push trigger disabled.
+1. ⬜ **Partially done.** `service/agent/dockerfile/Dockerfile` exists and installs `onedrive`, but via the OBS apt
+   repo (amended D6), not the multi-stage source compile this document originally specified. `ONEDRIVE_VERSION`
+   pinning as described doesn't apply to this approach — confirm what version the OBS repo actually resolves to and
+   whether it needs separate pinning.
+2. ⬜ **Still open.** The two named volumes exist in `service/agent/compose.yml`'s definition, but there's no
+   confirmation here that they're actually provisioned and mounted on a real, running agent host yet.
+3. ⬜ **Still open.** `Jenkinsfile` is still the single-stage draft described in Section 6.5 — no agent label pin, no
+   cron trigger, no `disableConcurrentBuilds()`, no `checkout scm` stage.
 
 ### 8.4 One-time setup and cutover
 
-1. **Service account** — provision a licensed dedicated SharePoint account with **write** access to the library; get a
-   Conditional Access exclusion from the tenant admin (D9).
-2. **Interactive authorization** — on the pinned agent, run `onedrive --confdir /onedrive/conf` once as that account
-   and complete the browser flow; confirm `refresh_token` lands in the `conf` volume (`chmod 600`).
-3. **First run** — trigger the job. Expect the download step to run for hours; it completes and proceeds. Watch the
-   first upload step's log (optionally the `--dry-run` line) — the pending-deletion count should be small.
-4. **Retire the old path** — remove the `onedrive` service from `compose.yml` and delete the Graph secrets
-   (`CLIENT_ID`, `CLIENT_SECRET`, `TENANT_ID`) from the secret store once the job is green. Keep `compose.yml` for
-   local development against test data if it is still useful (D18).
+⬜ **Still entirely open** — service account provisioning (D9), the first interactive `--auth` run on the real pinned
+agent, the first real production run, and retiring the local-dev-only `compose.yml` sidecar path are all unconfirmed
+as of this update.
 
 ---
 
@@ -590,6 +644,9 @@ code of record is `src/justifactu/process.py`.
   an incident — a normal run deletes only the bills it just processed.
 - **After an `ONEDRIVE_VERSION` bump**, watch the first run: one longer-than-usual download step is expected; a
   *repeated* long download means every run is re-scanning and something is wrong with `data`/`conf` persistence.
+- **Fallback usage.** If the Graph fallback (D26) is triggering regularly rather than only in rare emergencies, that's
+  itself a signal worth monitoring — it means the primary OneDrive sync is unreliable, not that the fallback is
+  doing its job as designed.
 
 ---
 
@@ -817,7 +874,7 @@ Authoritative. Read this before changing anything. Decision IDs are stable; a fe
 - **Consequences:** D10 and D12 are withdrawn; the pipeline has no gate stage; correctness rests on
   `subprocess.run(..., check=True)` around each `onedrive` call.
 
-## D24 — Retire `sync_list`; `--single-directory` is the only scope filter
+#### D24 — Retire `sync_list`; `--single-directory` is the only scope filter
 
 **Context:** _input is retired. sync_list previously listed `/justifactu/_input`
 as the only synced path — an inclusion whitelist. The pipeline now scopes to
@@ -851,7 +908,7 @@ listed, even if --single-directory also targets it. Flag this prominently,
 not just in a decision log entry — maybe a comment pointer from
 compose.yml or the onedrive conf directory's README/.gitignore too.
 
-## D25 — CLI-args-driven local paths replace hardcoded Docker paths
+#### D25 — CLI-args-driven local paths replace hardcoded Docker paths
 
 **Context:** confdir came from `OD_CONFDIR` env var, defaulting to the
 Docker-only `/onedrive/conf`; sync_dir was hardcoded in
@@ -893,6 +950,120 @@ passes alike) or the local sync-state database has no continuity between
 calls — this isn't optional plumbing, it's required for the delta-sync
 mechanism (see existing Glossary entry for items.sqlite3) to work at all.
 
+#### D26 — Reintroduce Microsoft Graph as a download-only fallback (amends D19)
+
+- **Context:** a production run failing outright whenever OneDrive-for-Linux's sync has a bad day — network blip,
+  a stuck `--resync`, a transient SharePoint throttling response — was judged too fragile for a nightly, mostly
+  unattended job.
+- **Decision:** on a download-sync failure only, `main()` catches the resulting `MainCriticalError` and falls back to
+  a direct Microsoft Graph download (`connect_sharepoint()` + `download_input_folder()`), scoped to the same remote
+  path and local destination the OneDrive sync would have used. If the fallback *also* fails, that exception is
+  wrapped into a fresh `MainCriticalError` and re-raised, so the run still fails cleanly — not silently.
+- **Why:** a working fallback is better than a hard stop for a failure mode that's plausibly transient. Scoping it to
+  download-only keeps the upload side's "one channel, one credential" property from D16/D19 intact.
+- **Consequences:** this reintroduces a **second, independent SharePoint credential path** — Graph app-only auth via
+  `TokenManager`/`CLIENT_ID`/`CLIENT_SECRET`/`TENANT_ID` — alongside OneDrive-for-Linux's own delegated-user OAuth
+  token. That's exactly the "two credentials to operate, authorize, rotate and monitor" situation D19 originally
+  argued against. A fallback whose own credentials nobody is actively rotating is a fallback that can silently stop
+  working — this hasn't been verified against the tenant's current app registration as of this update. `token_manager.py`
+  and the Graph-reading half of `sharepoint.py` are live again, with a narrower surface than before (8.1).
+
+#### D27 — `--auth` becomes a dedicated bootstrap command, not an interactive raw `onedrive` invocation
+
+- **Context:** the original design assumed a human runs `onedrive --confdir ...` directly. In practice the app needed
+  a supported, documented entry point for this that didn't require knowing the client's own CLI.
+- **Decision:** `main.py` gates a `--auth` flag on `args.location == InputLocation.SHAREPOINT`, calling a dedicated
+  `onedrive_sync.py::run_onedrive_auth(confdir, data_folder)` — not the same function used for the regular sync.
+  It shells out to `onedrive --confdir <confdir> --syncdir <data_folder> --verbose`, with no `--single-directory`,
+  `--sync`, or `--monitor` flags. `exit(0)` immediately after, regardless of outcome signal beyond the subprocess's
+  own exit code.
+- **Why:** confirmed against upstream `onedrive` source (not just docs) that `initialise()` — where OAuth and token
+  persistence happen — runs unconditionally, regardless of `--sync`/`--monitor`. On a genuinely fresh `confdir`, a
+  plain invocation with none of those flags completes OAuth, persists the token, and exits `0` — no sync engine, no
+  file transfer at all (one caveat: `initialise()` itself still makes two small Graph metadata calls — drive details
+  and root details — not a bulk download).
+- **Consequences:** re-running `--auth` after a token already exists for that `confdir` now exits non-zero ("missing
+  switches"), since the client's fast-fail path only triggers when a token is already present — a known, accepted
+  limitation since `--auth` is meant to be one-time, per-`confdir` setup. This superseded an earlier version of the
+  bootstrap that scoped a real `--sync --download-only` pass to a dedicated empty remote folder
+  (`justifactu/_auth_sync`) specifically to avoid a bulk download during auth — that folder/path constant has been
+  removed from the codebase; the `--auth` branch no longer uses `--single-directory` at all, so it's moot.
+
+#### D28 — `drive_id` resolved per-call from Vault, never stored permanently in the tracked config file
+
+- **Context:** `service/onedrive/conf/config` is git-tracked. Permanently storing a live `drive_id` secret in it was a
+  standing exposure.
+- **Decision:** `service/onedrive/conf/config` now has `drive_id = ""` as a placeholder. `onedrive_sync.py` resolves
+  the real value via `read_secret(SecretNames.DRIVE_ID.value)` and rewrites the `drive_id` line in the config file
+  immediately before each `onedrive` subprocess invocation (`_write_drive_id`), then blanks it back to `""`
+  (`erase_drive_id`) afterward — wrapping each individual invocation, not once per whole process.
+- **Why:** keeps the real secret off disk except for the brief window an `onedrive` subprocess actually needs it.
+- **Consequences:** the erase must be guaranteed on every exit path, including an exception mid-call — it's called
+  from a `finally` on the outer `try` in both `run_onedrive_sync` and `run_onedrive_auth`. An earlier version called
+  it as plain sequential code *after* a successful `subprocess.run`, which meant a failed sync skipped the erase
+  entirely and left the secret sitting in the tracked file — fixed; don't reintroduce the sequential-call version.
+
+#### D29 — `--mode {prod,test}` replaces an env-var-only switch; `--phase` adds an isolated single-stage test path
+
+- **Context:** the bills/payments source folder names were a single hardcoded test pair
+  (`FACTURES_prova`/`Remeses_prova`) with a `TODO: Remove when entering into production` comment and no actual
+  production pair defined anywhere.
+- **Decision:** `FolderName` now has explicit `BILLS_INPUT_PROD`/`BILLS_INPUT_TEST`/`PAYMENTS_INPUT_PROD`/
+  `PAYMENTS_INPUT_TEST` pairs (`"FACTURES"`/`"FACTURES_prova"`/`"Remeses"`/`"Remeses_prova"`), and a new `Mode(StrEnum)`
+  (`PROD`/`TEST`) selected by a `--mode` CLI flag, default `Mode.TEST`. `src/justifactu/paths.py::bills_folder()`/
+  `payments_folder()` take `(input_folder, mode)` and additionally nest test-mode paths one level deeper, under a
+  `carpeta_proves` folder (`FolderName.TEST_FOLDER`) — production mode reads directly from `FACTURES`/`Remeses` with
+  no such wrapper.
+- **Why:** makes the test/production switch an explicit, visible, per-invocation choice instead of a silent default
+  baked into source, and keeps local test fixtures (`carpeta_proves/...`) structurally separate from where production
+  data would ever live, so a stray local test folder can never be mistaken for real synced SharePoint content.
+- **Consequences:** separately, `--phase {1,2,3}` was reworked to live inside `main()` itself (not a branch in
+  `__main__.py`, which is now a one-line `if __name__ == "__main__": main()` wrapper) — see Section 7.1a. Production
+  Jenkins invocations must explicitly pass `--mode prod` once this is deployed, or the job silently stays in test
+  mode regardless of the agent image's environment. The agent Dockerfile's `BILLS_INPUT_FOLDER`/`PAYMENTS_INPUT_FOLDER`
+  `ENV` lines (Section 6.2) are leftovers from an earlier, env-var-only version of this same switch and should be
+  removed.
+
+#### D30 — `notify.py` replaces `emailext` for Jenkinsfile failure/abort notifications
+
+- **Context:** the original Jenkinsfile design used the `emailext` step for `post { failure }`/`post { aborted }`.
+- **Decision:** a new standalone entry point, `src/justifactu/notify.py` (`justifactu-notify` console script, `make
+  notify` target), parses `--to`/`--subject`/`--body`/repeatable `--attach`, and calls
+  `mail.py::send_mail_authenticated`, letting exceptions propagate (unlike `main()`'s own error handling). The
+  Jenkinsfile's `post` blocks now call `make notify CMD="..."` via `sh` steps instead of `emailext(...)`.
+- **Why:** reuses the same authenticated SMTP path and secret-resolution chain the rest of the app already has,
+  rather than depending on the Jenkins *Email Extension* plugin being installed and configured on the agent.
+- **Consequences:** `--to` is optional, falling back to the `SMTP_ADMIN_EMAIL` secret when omitted — both current
+  Jenkinsfile `post` blocks rely on that fallback rather than passing `--to` explicitly.
+
+#### D31 — `OD_CONF`/`OD_DATA` env vars resolve through `defaults.py`, not inline literals in `arguments.py`
+
+- **Context:** following D25's CLI-args-driven path design, the `ROOT_FOLDER`-relative fallback values for
+  `--onedrive-conf-folder`/`--onedrive-data-folder` were still written as inline `Path` expressions directly inside
+  `arguments.py`, duplicating logic that also appeared (differently) elsewhere.
+- **Decision:** `src/justifactu/defaults.py` now exposes `default_onedrive_data_folder()`/
+  `default_onedrive_conf_folder()`/`default_secrets_folder()` — zero-argument functions composed from `ROOT_FOLDER`
+  and `FolderName` segments only, never a raw string literal. `arguments.py` wraps their results in the same
+  `os.environ.get("OD_DATA"/"OD_CONF", str(default_...()))` pattern as before — the env-var override behavior from
+  D25 is unchanged, only where the fallback value comes from.
+- **Why:** part of a broader cleanup (`defines.py` → bare-name enums only; `paths.py` → runtime path composition;
+  `defaults.py` → CLI-flag fallback composition) that removed every hardcoded folder/file-name string literal from
+  the codebase outside `defines.py`'s own enums.
+- **Consequences:** `secret.py`/`vault.py` were also switched from inlining `ROOT_FOLDER / "secrets"` to calling
+  `default_secrets_folder()`. `defines.py`'s `FolderPaths` enum (and its two dead module-level `_SHAREPOINT_INPUT_PATH`/
+  `_SHAREPOINT_OUTPUT_PATH` helpers) were deleted outright; the one member that was actually used,
+  `SHAREPOINT_SYNC_FOLDER`, moved into `paths.py::sharepoint_sync_folder()`.
+
+#### D32 — `main()`'s outer exception handler now actually exits non-zero
+
+- **Context:** `except MainCriticalError` originally only logged the error — every failure (a failed sync, a failed
+  phase, a missing `onedrive` binary) produced exit code `0`, identical to success.
+- **Decision:** add `exit(1)` to the outer `except MainCriticalError` block.
+- **Why:** this is the thing that makes every claim in this document about "a failed run fails the Jenkins build" and
+  trips `post { failure }` actually true. Before this fix, the whole premise this document is built on — failures
+  being detectable by exit code — was describing intended behavior the code didn't have yet.
+- **Consequences:** confirmed `finally` still runs even when `exit()` is called inside `except` (it raises
+  `SystemExit`, which doesn't skip `finally`) — the QA report mail still sends on a failed run.
 ### 11.2 Decisions still open
 
 - **Stage 3 specification.** The credit-card payments step (D22) needs its matching / naming / cleanup rules
@@ -908,6 +1079,8 @@ mechanism (see existing Glossary entry for items.sqlite3) to work at all.
   Access exclusion. Prerequisite, not done.
 - **`ONEDRIVE_VERSION` value.** The Dockerfile draft pins a placeholder; confirm the current `2.5.x` release before the
   first build.
+- **Production Jenkins invocation never passes `--mode prod`.** Until the `Jenkinsfile`'s `make run` line is
+  updated to include it, a "production" run of this pipeline silently stays in test mode (D29).
 
 ---
 
@@ -932,7 +1105,12 @@ mechanism (see existing Glossary entry for items.sqlite3) to work at all.
 | **Pinned agent** | A Jenkins agent selected by a fixed label. The job always runs there because only that node has the `onedrive` binary and the volumes. |
 | **Stage 1 / 2 / 3** | The three processing steps inside `python -m justifactu`: `rename_payments`; `merge_bills_and_payments` (+ `cleanup_processed_files`); credit-card payments. Same process, same local tree, in order. |
 | **Microsoft Graph API** | Microsoft's REST API for Microsoft 365. Used by the *previous* design for every SharePoint change; **removed** here (D19). |
-
+| **`--auth`** | CLI flag gating the one-time OAuth bootstrap (D27), via `run_onedrive_auth` — distinct from the regular sync wrapper. |
+| **`--phase`** | CLI flag (`1`/`2`/`3`) that runs exactly one pipeline phase in isolation, skipping the OneDrive sync and the `--auth` check entirely. Lives inside `main()` itself (D29). |
+| **`Mode` / `--mode`** | `StrEnum` (`PROD`/`TEST`) and matching CLI flag, default `TEST`, selecting which `FolderName` pair (`*_PROD` vs `*_TEST`) the bills/payments folders resolve to (D29). |
+| **`carpeta_proves`** | `FolderName.TEST_FOLDER` — the extra path segment inserted only in `Mode.TEST`, between the runtime folder and the test-mode bills/payments folders. Never present in `Mode.PROD`. |
+| **Graph fallback** | The reintroduced, download-only Microsoft Graph path (D26) that `main()` falls back to if the primary OneDrive sync fails to download. No equivalent exists for uploads. |
+| **`notify.py` / `justifactu-notify`** | Standalone CLI entry point for sending a one-off notification email with optional attachments, used by the Jenkinsfile's `post` blocks instead of `emailext` (D30). |
 ---
 
 ## 13. References
